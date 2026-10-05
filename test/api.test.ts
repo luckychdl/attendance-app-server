@@ -1,0 +1,452 @@
+import 'reflect-metadata';
+
+import type { INestApplication } from '@nestjs/common';
+import { Test } from '@nestjs/testing';
+import bcrypt from 'bcryptjs';
+import request from 'supertest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { AppModule } from '../src/app.module.ts';
+import { CLOCK, ENV, REPO } from '../src/common/tokens.ts';
+import type { Env } from '../src/env.ts';
+import { grantedDays } from '../src/lib/leave-rules.ts';
+import { createClock } from '../src/lib/time.ts';
+import type { EmployeeRow } from '../src/repo/types.ts';
+import { createMemoryRepo, type MemoryData } from './memory-repo.ts';
+
+const PASSWORD_HASH = bcrypt.hashSync('1234', 4);
+const HQ = { latitude: 37.5666805, longitude: 126.9784147 };
+const FAR = { latitude: 37.4979, longitude: 127.0276 }; // 강남역
+
+const TEST_ENV: Env = {
+  supabaseUrl: 'http://unused',
+  supabaseServiceRoleKey: 'unused',
+  jwtSecret: 'test-secret-test-secret-test-secret!',
+  tokenTtlDays: 30,
+  port: 0,
+  timeZone: 'Asia/Seoul',
+};
+
+function employee(id: string, patch: Partial<EmployeeRow>): EmployeeRow {
+  return {
+    id,
+    employeeNo: id,
+    name: id,
+    department: '개발팀',
+    position: '사원',
+    role: 'member',
+    passwordHash: PASSWORD_HASH,
+    hiredAt: '2020-03-02',
+    annualLeaveDays: 15,
+    active: true,
+    ...patch,
+  };
+}
+
+/** 한국 시각으로 시계를 맞춘다. 2026-10-06 은 화요일 */
+const kst = (date: string, time: string) => new Date(`${date}T${time}:00+09:00`);
+
+let now: Date;
+let data: MemoryData;
+let app: INestApplication;
+const tokens = new Map<string, string>();
+
+beforeEach(async () => {
+  now = kst('2026-10-06', '08:58');
+  tokens.clear();
+  data = {
+    employees: [
+      employee('1001', { name: '김민준', position: '팀장', role: 'manager' }),
+      employee('1002', { name: '이서연' }),
+      employee('2001', { name: '박지호', department: '영업팀' }),
+      employee('2002', { name: '최영업', department: '영업팀', role: 'manager' }),
+    ],
+    worksite: {
+      id: 'hq',
+      name: '본사',
+      ...HQ,
+      radiusMeters: 200,
+      startHour: 9,
+      startMinute: 0,
+      endHour: 18,
+      endMinute: 0,
+    },
+    attendance: [],
+    leaves: [],
+    holidays: ['2026-10-09'],
+  };
+
+  // 실제 모듈 구성을 그대로 띄우고 환경 변수 · 시계 · 저장소만 바꿔 끼운다.
+  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+    .overrideProvider(ENV)
+    .useValue(TEST_ENV)
+    .overrideProvider(CLOCK)
+    .useValue(createClock('Asia/Seoul', () => now))
+    .overrideProvider(REPO)
+    .useValue(createMemoryRepo(data))
+    .compile();
+  app = moduleRef.createNestApplication();
+  await app.init();
+});
+
+afterEach(() => app.close());
+
+async function call(as: string | null, method: string, path: string, body?: unknown) {
+  if (as && !tokens.has(as)) {
+    const login = await request(app.getHttpServer())
+      .post('/auth/login')
+      .send({ employeeNo: as, password: '1234' });
+    tokens.set(as, login.body.token);
+  }
+
+  let req = request(app.getHttpServer())[method.toLowerCase() as 'get' | 'post' | 'patch'](path);
+  if (as) req = req.set('Authorization', `Bearer ${tokens.get(as)}`);
+  const response = await (body === undefined ? req : req.send(body as object));
+
+  // 성공은 JSON, 실패는 문장 그대로 온다.
+  const isJson = response.type === 'application/json';
+  return {
+    status: response.status,
+    type: response.type,
+    text: response.text,
+    body: isJson ? JSON.parse(response.text) : response.text,
+  };
+}
+
+const check = (as: string, kind: 'in' | 'out', location: object | null = HQ, note?: string) =>
+  call(as, 'POST', `/attendance/check-${kind}`, { employeeId: as, location, note });
+
+const requestLeave = (as: string, input: object) =>
+  call(as, 'POST', '/leave/requests', { employeeId: as, ...input });
+
+describe('인증', () => {
+  it('사번과 비밀번호로 세션을 받는다', async () => {
+    const { status, body } = await call(null, 'POST', '/auth/login', {
+      employeeNo: ' 1001 ',
+      password: '1234',
+    });
+    expect(status).toBe(200);
+    expect(body.employee).toEqual({
+      id: '1001',
+      employeeNo: '1001',
+      name: '김민준',
+      department: '개발팀',
+      position: '팀장',
+      role: 'manager',
+    });
+    expect(body.token).toEqual(expect.any(String));
+
+    expect((await call('1001', 'GET', '/auth/me')).body).toEqual(body.employee);
+  });
+
+  it('틀리면 문장을 text/plain 본문으로 내려준다', async () => {
+    for (const input of [
+      { employeeNo: '1001', password: 'nope' },
+      { employeeNo: '9999', password: '1234' },
+    ]) {
+      const { status, type, body } = await call(null, 'POST', '/auth/login', input);
+      expect(status).toBe(401);
+      expect(type).toBe('text/plain');
+      expect(body).toBe('사번 또는 비밀번호가 올바르지 않습니다.');
+    }
+  });
+
+  it('토큰이 없거나, 만료됐거나, 퇴사 처리되면 막는다', async () => {
+    expect((await call(null, 'GET', '/worksite')).body).toBe('로그인이 필요합니다.');
+
+    expect((await call('1002', 'GET', '/worksite')).status).toBe(200);
+    data.employees[1].active = false;
+    expect((await call('1002', 'GET', '/worksite')).status).toBe(401);
+    data.employees[1].active = true;
+
+    now = kst('2026-11-06', '09:00');
+    expect((await call('1002', 'GET', '/worksite')).status).toBe(401);
+  });
+
+  it('다른 직원의 id 로는 조회할 수 없다', async () => {
+    const { status } = await call('1002', 'GET', '/attendance/today?employeeId=1001');
+    expect(status).toBe(403);
+  });
+
+  it('없는 경로와 깨진 요청도 한국어 문장으로 답한다', async () => {
+    expect(await call(null, 'GET', '/health')).toMatchObject({ status: 200, body: { ok: true } });
+    expect(await call(null, 'GET', '/nope')).toMatchObject({
+      status: 404,
+      body: '요청한 경로를 찾을 수 없습니다.',
+    });
+
+    const broken = await request(app.getHttpServer())
+      .post('/auth/login')
+      .set('Content-Type', 'application/json')
+      .send('{oops');
+    expect(broken.status).toBe(400);
+    expect(broken.text).toBe('요청 형식이 올바르지 않습니다.');
+
+    expect((await call(null, 'POST', '/auth/login', { employeeNo: '1001' })).status).toBe(400);
+  });
+});
+
+describe('출퇴근', () => {
+  it('출근 전의 오늘 기록은 JSON null 이다', async () => {
+    const today = await call('1002', 'GET', '/attendance/today?employeeId=1002');
+    expect(today).toMatchObject({ status: 200, type: 'application/json', text: 'null' });
+  });
+
+  it('출근 → 퇴근하면 근무시간과 상태가 정해진다', async () => {
+    const checkedIn = await check('1002', 'in');
+    expect(checkedIn.status).toBe(200);
+    expect(checkedIn.body).toMatchObject({
+      workDate: '2026-10-06',
+      status: 'working',
+      checkOutAt: null,
+      checkInLocation: HQ,
+    });
+    expect((await call('1002', 'GET', '/attendance/today?employeeId=1002')).body.id).toBe(
+      checkedIn.body.id,
+    );
+    expect((await check('1002', 'in')).status).toBe(409);
+
+    now = kst('2026-10-06', '18:02');
+    const checkedOut = await check('1002', 'out');
+    expect(checkedOut.body).toMatchObject({ status: 'normal', workedMinutes: 544 });
+    expect((await check('1002', 'out')).body).toBe('오늘은 이미 퇴근 체크를 완료했습니다.');
+  });
+
+  it('5분 여유를 넘기면 지각·조기퇴근이다', async () => {
+    now = new Date('2026-10-06T09:05:20+09:00');
+    await check('1001', 'in');
+    now = kst('2026-10-06', '09:06');
+    await check('1002', 'in');
+
+    now = kst('2026-10-06', '17:55');
+    expect((await check('1001', 'out')).body.status).toBe('normal');
+    now = kst('2026-10-06', '17:54');
+    expect((await check('1002', 'out')).body.status).toBe('lateAndEarlyLeave');
+
+    const summary = await call('1002', 'GET', '/attendance/summary?employeeId=1002&month=2026-10');
+    expect(summary.body).toEqual({
+      month: '2026-10',
+      workedDays: 1,
+      lateDays: 1,
+      earlyLeaveDays: 1,
+      totalWorkedMinutes: 528,
+    });
+  });
+
+  it('반경 밖이나 위치 없이 기록하려면 사유가 있어야 한다', async () => {
+    expect((await check('1002', 'in', FAR)).status).toBe(400);
+    expect((await check('1002', 'in', null)).status).toBe(400);
+
+    const outside = await check('1002', 'in', FAR, '외부 근무');
+    expect(outside.body).toMatchObject({ note: '외부 근무', checkInLocation: FAR });
+
+    // 사무실로 돌아와 퇴근해도 출근 때 남긴 사유는 남는다.
+    now = kst('2026-10-06', '18:00');
+    expect((await check('1002', 'out')).body.note).toBe('외부 근무');
+  });
+
+  it('근무일은 한국 날짜로 끊고, 지난 날의 미퇴근은 퇴근 미체크가 된다', async () => {
+    now = kst('2026-10-06', '00:30'); // UTC 로는 아직 5일
+    expect((await check('1002', 'in')).body.workDate).toBe('2026-10-06');
+
+    now = kst('2026-10-07', '08:50');
+    expect((await call('1002', 'GET', '/attendance/today?employeeId=1002')).body).toBeNull();
+    expect((await check('1002', 'out')).status).toBe(409);
+
+    const records = await call(
+      '1002',
+      'GET',
+      '/attendance/records?employeeId=1002&from=2026-10-01&to=2026-10-31',
+    );
+    expect(records.body).toHaveLength(1);
+    expect(records.body[0].status).toBe('missingCheckOut');
+  });
+
+  it('승인된 오전 반차가 있으면 14시 출근이 기준이다', async () => {
+    await requestLeave('1002', { type: 'halfAm', startDate: '2026-10-07', endDate: '2026-10-07' });
+    const approved = await call('1001', 'POST', `/leave/requests/${data.leaves[0].id}/approve`);
+    expect(approved.body.status).toBe('approved');
+
+    now = kst('2026-10-07', '13:58');
+    await check('1002', 'in');
+    now = kst('2026-10-07', '18:00');
+    expect((await check('1002', 'out')).body.status).toBe('normal');
+  });
+});
+
+describe('근무지', () => {
+  it('팀장만 바꿀 수 있다', async () => {
+    expect((await call('1002', 'PATCH', '/worksite', { radiusMeters: 500 })).status).toBe(403);
+
+    const updated = await call('1001', 'PATCH', '/worksite', {
+      ...data.worksite,
+      id: 'ignored',
+      radiusMeters: 500,
+    });
+    expect(updated.body).toMatchObject({ id: 'hq', radiusMeters: 500 });
+
+    const invalid = await call('1001', 'PATCH', '/worksite', { endHour: 8 });
+    expect(invalid.status).toBe(400);
+  });
+});
+
+describe('휴가', () => {
+  it('신청 → 결재함 → 승인까지 잔여가 따라 움직인다', async () => {
+    // 목~월. 금요일(한글날)과 주말은 빠져 2일만 차감된다.
+    const requested = await requestLeave('1002', {
+      type: 'annual',
+      startDate: '2026-10-08',
+      endDate: '2026-10-12',
+      reason: ' 가족 여행 ',
+    });
+    expect(requested.body).toMatchObject({
+      employeeName: '이서연',
+      department: '개발팀',
+      days: 2,
+      status: 'pending',
+      reason: '가족 여행',
+      decidedAt: null,
+    });
+    const id = requested.body.id;
+
+    const balance = () => call('1002', 'GET', '/leave/balance?employeeId=1002&year=2026');
+    expect((await balance()).body).toEqual({
+      year: 2026,
+      granted: 15,
+      used: 0,
+      pending: 2,
+      remaining: 13,
+    });
+
+    expect((await call('1001', 'GET', '/leave/inbox?approverId=1001')).body).toHaveLength(1);
+    expect((await call('2002', 'GET', '/leave/inbox?approverId=2002')).body).toHaveLength(0);
+    expect((await call('1002', 'GET', '/leave/inbox?approverId=1002')).body).toEqual([]);
+
+    expect((await call('2002', 'POST', `/leave/requests/${id}/approve`)).status).toBe(403);
+    expect((await call('1002', 'POST', `/leave/requests/${id}/approve`)).status).toBe(403);
+
+    const approved = await call('1001', 'POST', `/leave/requests/${id}/approve`);
+    expect(approved.body).toMatchObject({ status: 'approved', decidedBy: '김민준' });
+    expect((await call('1001', 'POST', `/leave/requests/${id}/reject`)).status).toBe(409);
+    expect((await balance()).body).toMatchObject({ used: 2, pending: 0, remaining: 13 });
+
+    const listed = await call(
+      '1002',
+      'GET',
+      '/leave/requests?employeeId=1002&from=2026-10-12&to=2026-10-12',
+    );
+    expect(listed.body.map((item: any) => item.id)).toEqual([id]);
+  });
+
+  it('시차는 점심을 건너 끝나고, 시간이 겹치는 신청은 거절한다', async () => {
+    const day = { startDate: '2026-10-07', endDate: '2026-10-07' };
+
+    const hourly = await requestLeave('1002', {
+      type: 'hourly',
+      ...day,
+      startTime: '11:00',
+      hours: 2,
+    });
+    expect(hourly.body).toMatchObject({ startTime: '11:00', endTime: '14:00', days: 0.25 });
+
+    expect((await requestLeave('1002', { type: 'halfPm', ...day })).status).toBe(200);
+    expect((await requestLeave('1002', { type: 'halfAm', ...day })).body).toBe(
+      '이미 신청한 휴가와 시간이 겹칩니다.',
+    );
+    expect((await requestLeave('1002', { type: 'annual', ...day })).status).toBe(409);
+
+    for (const bad of [
+      { startTime: '12:00', hours: 2 },
+      { startTime: '17:00', hours: 2 },
+      { startTime: '09:00', hours: 3 },
+      { hours: 2 },
+    ]) {
+      const { status } = await requestLeave('1002', {
+        type: 'hourly',
+        startDate: '2026-10-13',
+        endDate: '2026-10-13',
+        ...bad,
+      });
+      expect(status).toBe(400);
+    }
+  });
+
+  it('지난 날짜·시각, 쉬는 날, 잔여 초과는 거절한다', async () => {
+    const single = (type: string, date: string, extra = {}) =>
+      requestLeave('1002', { type, startDate: date, endDate: date, ...extra });
+
+    expect((await single('annual', '2026-10-05')).status).toBe(400);
+    expect((await single('halfAm', '2026-10-10')).status).toBe(400); // 토요일
+    expect((await single('halfAm', '2026-10-09')).status).toBe(400); // 한글날
+    expect((await single('annual', '2026-10-10')).body).toBe('고른 기간에 평일이 없습니다.');
+    expect((await single('annual', '2026-02-30')).status).toBe(400);
+
+    now = kst('2026-10-06', '10:30');
+    expect((await single('hourly', '2026-10-06', { startTime: '10:00', hours: 2 })).status).toBe(400);
+    expect((await single('hourly', '2026-10-06', { startTime: '11:00', hours: 2 })).status).toBe(200);
+
+    data.employees[1].annualLeaveDays = 1;
+    const over = await requestLeave('1002', {
+      type: 'annual',
+      startDate: '2026-10-13',
+      endDate: '2026-10-14',
+    });
+    expect(over.body).toBe('남은 연차가 0.75일이라 신청할 수 없습니다.');
+  });
+
+  it('동시에 들어온 같은 신청은 하나만 받는다', async () => {
+    await call('1002', 'GET', '/worksite'); // 토큰 준비
+    const input = { type: 'annual', startDate: '2026-10-13', endDate: '2026-10-13' };
+    const results = await Promise.all([requestLeave('1002', input), requestLeave('1002', input)]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(data.leaves).toHaveLength(1);
+  });
+
+  it('팀장 신청은 바로 승인되고, 취소는 본인이 시작일 전까지만 한다', async () => {
+    const mine = await requestLeave('1001', {
+      type: 'annual',
+      startDate: '2026-10-07',
+      endDate: '2026-10-07',
+    });
+    expect(mine.body).toMatchObject({ status: 'approved', decidedBy: '김민준' });
+    const id = mine.body.id;
+
+    expect((await call('1002', 'POST', `/leave/requests/${id}/cancel`)).status).toBe(403);
+    expect((await call('1001', 'POST', '/leave/requests/nope/cancel')).status).toBe(404);
+
+    now = kst('2026-10-07', '08:00');
+    expect((await call('1001', 'POST', `/leave/requests/${id}/cancel`)).status).toBe(409);
+
+    now = kst('2026-10-06', '08:58');
+    const cancelled = await call('1001', 'POST', `/leave/requests/${id}/cancel`);
+    expect(cancelled.body.status).toBe('cancelled');
+    expect((await call('1001', 'POST', `/leave/requests/${id}/cancel`)).status).toBe(409);
+
+    // 취소한 자리는 다시 쓸 수 있다.
+    const again = await requestLeave('1001', {
+      type: 'annual',
+      startDate: '2026-10-07',
+      endDate: '2026-10-07',
+    });
+    expect(again.status).toBe(200);
+  });
+});
+
+describe('규칙', () => {
+  it('연차는 근속연수로 부여한다', () => {
+    const hired = (hiredAt: string) => ({ hiredAt, annualLeaveDays: null });
+    expect(grantedDays(hired('2026-03-15'), 2026)).toBe(9);
+    expect(grantedDays(hired('2026-01-01'), 2026)).toBe(11);
+    expect(grantedDays(hired('2025-07-01'), 2026)).toBe(15);
+    expect(grantedDays(hired('2023-07-01'), 2026)).toBe(16);
+    expect(grantedDays(hired('1990-01-01'), 2026)).toBe(25);
+    expect(grantedDays(hired('2027-01-01'), 2026)).toBe(0);
+    expect(grantedDays({ hiredAt: '2026-03-15', annualLeaveDays: 20 }, 2026)).toBe(20);
+  });
+
+  it('타임존 시각을 실제 시각으로 바꾼다', () => {
+    const clock = createClock('Asia/Seoul');
+    expect(clock.instantAt('2026-10-06', 9 * 60).toISOString()).toBe('2026-10-06T00:00:00.000Z');
+    expect(clock.minutesSince('2026-10-06', '2026-10-06T15:30:00Z')).toBe(24 * 60 + 30);
+  });
+});
