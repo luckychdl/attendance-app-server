@@ -5,7 +5,7 @@ import { CLOCK, REPO } from '../common/tokens.ts';
 import { resolveStatus } from '../lib/attendance-rules.ts';
 import { distanceInMeters } from '../lib/geo.ts';
 import { type Clock, minutesBetween, monthRange } from '../lib/time.ts';
-import type { Repo } from '../repo/types.ts';
+import type { EmployeeRow, Repo } from '../repo/types.ts';
 import type { AttendanceRecord, GeoPoint, MonthlySummary, Worksite } from '../types.ts';
 
 export type CheckContext = {
@@ -74,8 +74,9 @@ export class AttendanceService {
     };
   }
 
-  async checkIn(employeeId: string, input: CheckContext) {
-    const note = requireNoteIfOutside(input, await this.repo.getWorksite());
+  async checkIn(me: EmployeeRow, input: CheckContext) {
+    const employeeId = me.id;
+    const note = requireNoteIfOutside(input, await this.repo.getWorksite(me.companyId));
     const now = this.clock.now();
 
     const created = await this.repo.insertAttendance({
@@ -93,7 +94,8 @@ export class AttendanceService {
     return created;
   }
 
-  async checkOut(employeeId: string, input: CheckContext) {
+  async checkOut(me: EmployeeRow, input: CheckContext) {
+    const employeeId = me.id;
     const alreadyDone = '오늘은 이미 퇴근 체크를 완료했습니다.';
     const now = this.clock.now();
     const today = this.clock.zoned(now).dateKey;
@@ -104,7 +106,7 @@ export class AttendanceService {
     }
     if (existing.checkOutAt) throw conflict(alreadyDone);
 
-    const worksite = await this.repo.getWorksite();
+    const worksite = await this.repo.getWorksite(me.companyId);
     const note = requireNoteIfOutside(input, worksite);
     const checkOutAt = now.toISOString();
 

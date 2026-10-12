@@ -43,8 +43,9 @@ export class LeaveService {
     return run;
   }
 
-  private async find(id: string) {
-    const leave = uuid.safeParse(id).success ? await this.repo.findLeave(id) : null;
+  /** 내 회사의 신청만 찾는다. */
+  private async find(id: string, me: EmployeeRow) {
+    const leave = uuid.safeParse(id).success ? await this.repo.findLeave(id, me.companyId) : null;
     if (!leave) throw notFound('신청 내역을 찾을 수 없습니다.');
     return leave;
   }
@@ -63,7 +64,7 @@ export class LeaveService {
   /** 결재자에게 올라온 대기 신청. 시작일이 가까운 순 */
   async inbox(approver: EmployeeRow) {
     if (approver.role !== 'manager') return [];
-    const pending = await this.repo.listPendingLeaves(approver.department);
+    const pending = await this.repo.listPendingLeaves(approver.companyId, approver.department);
     return pending.filter((leave) => leave.employeeId !== approver.id);
   }
 
@@ -89,7 +90,7 @@ export class LeaveService {
     }
 
     // 시차는 정해진 시간대 중 하나여야 한다. 종료 시각은 점심을 건너 서버가 정한다.
-    const worksite = await repo.getWorksite();
+    const worksite = await repo.getWorksite(me.companyId);
     let startTime: string | null = null;
     let endTime: string | null = null;
     let hours: number | null = null;
@@ -129,7 +130,7 @@ export class LeaveService {
       const autoApprove = me.role === 'manager';
       const requestedAt = clock.now().toISOString();
 
-      return repo.insertLeave({
+      return repo.insertLeave(me.companyId, {
         employeeId: me.id,
         employeeName: me.name,
         department: me.department,
@@ -150,7 +151,7 @@ export class LeaveService {
 
   /** 본인 신청 취소. 승인된 건은 시작일 전까지만 */
   async cancel(id: string, me: EmployeeRow) {
-    const leave = await this.find(id);
+    const leave = await this.find(id, me);
     const notCancellable = '이미 시작했거나 처리가 끝난 휴가입니다.';
 
     if (leave.employeeId !== me.id) throw forbidden('본인 신청만 취소할 수 있습니다.');
@@ -165,7 +166,7 @@ export class LeaveService {
 
   /** 결재자는 같은 부서의 팀장. 본인 신청은 결재하지 않는다. */
   async decide(id: string, approver: EmployeeRow, status: 'approved' | 'rejected') {
-    const leave = await this.find(id);
+    const leave = await this.find(id, approver);
     const alreadyDone = '이미 처리된 신청입니다.';
 
     if (approver.role !== 'manager' || approver.department !== leave.department) {

@@ -1,7 +1,7 @@
 import { createClient, type PostgrestError } from '@supabase/supabase-js';
 
 import type { AttendanceRecord, LeaveRequest, Worksite } from '../types.ts';
-import type { EmployeeRow, Repo } from './types.ts';
+import type { EmployeeRow, NewEmployee, Repo } from './types.ts';
 
 type Row = Record<string, any>;
 
@@ -25,6 +25,8 @@ const iso = (value: string | null) => (value ? new Date(value).toISOString() : n
 function toEmployee(row: Row): EmployeeRow {
   return {
     id: row.id,
+    companyId: row.company_id,
+    companyName: row.companies.name,
     employeeNo: row.employee_no,
     name: row.name,
     department: row.department,
@@ -36,6 +38,9 @@ function toEmployee(row: Row): EmployeeRow {
     active: row.active,
   };
 }
+
+/** 직원을 읽을 때는 응답에 실을 회사 이름까지 함께 가져온다. */
+const EMPLOYEE_SELECT = '*, companies(name)';
 
 function toWorksite(row: Row): Worksite {
   return {
@@ -104,23 +109,69 @@ export function createSupabaseRepo(url: string, serviceRoleKey: string): Repo {
   });
 
   return {
-    async findEmployeeByNo(employeeNo) {
+    async findCompany(nameKey) {
       const row = check(
-        await db.from('employees').select().eq('employee_no', employeeNo).maybeSingle(),
+        await db.from('companies').select('id, name').eq('name_key', nameKey).maybeSingle(),
+      );
+      return row ? { id: row.id, name: row.name } : null;
+    },
+
+    async createCompany(name, nameKey, owner) {
+      const result = await db.rpc('create_company_with_owner', {
+        p_company_name: name,
+        p_company_key: nameKey,
+        p_employee_no: owner.employeeNo,
+        p_name: owner.name,
+        p_department: owner.department,
+        p_position: owner.position,
+        p_password_hash: owner.passwordHash,
+      });
+      if (result.error?.code === UNIQUE_VIOLATION) return null;
+      return this.findEmployeeById(check(result) as string);
+    },
+
+    async insertEmployee(companyId, employee: NewEmployee) {
+      const result = await db
+        .from('employees')
+        .insert({
+          company_id: companyId,
+          employee_no: employee.employeeNo,
+          name: employee.name,
+          department: employee.department,
+          position: employee.position,
+          role: 'member',
+          password_hash: employee.passwordHash,
+        })
+        .select(EMPLOYEE_SELECT)
+        .single();
+      if (result.error?.code === UNIQUE_VIOLATION) return null;
+      return toEmployee(one(result));
+    },
+
+    async findEmployeeByNo(companyId, employeeNo) {
+      const row = check(
+        await db
+          .from('employees')
+          .select(EMPLOYEE_SELECT)
+          .eq('company_id', companyId)
+          .eq('employee_no', employeeNo)
+          .maybeSingle(),
       );
       return row ? toEmployee(row) : null;
     },
 
     async findEmployeeById(id) {
-      const row = check(await db.from('employees').select().eq('id', id).maybeSingle());
+      const row = check(
+        await db.from('employees').select(EMPLOYEE_SELECT).eq('id', id).maybeSingle(),
+      );
       return row ? toEmployee(row) : null;
     },
 
-    async getWorksite() {
+    async getWorksite(companyId) {
       const row = check(
-        await db.from('worksites').select().order('created_at').limit(1).maybeSingle(),
+        await db.from('worksites').select().eq('company_id', companyId).maybeSingle(),
       );
-      if (!row) throw new Error('worksites 테이블이 비어 있습니다. 마이그레이션을 확인해 주세요.');
+      if (!row) throw new Error(`회사 ${companyId} 의 근무지가 없습니다.`);
       return toWorksite(row);
     },
 
@@ -199,8 +250,15 @@ export function createSupabaseRepo(url: string, serviceRoleKey: string): Repo {
       return row ? toAttendance(row) : null;
     },
 
-    async findLeave(id) {
-      const row = check(await db.from('leave_requests').select().eq('id', id).maybeSingle());
+    async findLeave(id, companyId) {
+      const row = check(
+        await db
+          .from('leave_requests')
+          .select()
+          .eq('id', id)
+          .eq('company_id', companyId)
+          .maybeSingle(),
+      );
       return row ? toLeave(row) : null;
     },
 
@@ -218,11 +276,12 @@ export function createSupabaseRepo(url: string, serviceRoleKey: string): Repo {
       return rows.map(toLeave);
     },
 
-    async listPendingLeaves(department) {
+    async listPendingLeaves(companyId, department) {
       const rows = many(
         await db
           .from('leave_requests')
           .select()
+          .eq('company_id', companyId)
           .eq('department', department)
           .eq('status', 'pending')
           .order('start_date'),
@@ -230,11 +289,12 @@ export function createSupabaseRepo(url: string, serviceRoleKey: string): Repo {
       return rows.map(toLeave);
     },
 
-    async insertLeave(leave) {
+    async insertLeave(companyId, leave) {
       const row = one(
         await db
           .from('leave_requests')
           .insert({
+            company_id: companyId,
             employee_id: leave.employeeId,
             employee_name: leave.employeeName,
             department: leave.department,

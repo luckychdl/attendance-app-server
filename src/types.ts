@@ -16,6 +16,8 @@ export type Employee = {
   position: string;
   /** manager 는 같은 부서의 휴가 신청을 결재한다. 구버전 세션에는 없을 수 있다. */
   role?: EmployeeRole;
+  /** 소속 회사 이름. 구버전 세션에는 없을 수 있다. */
+  companyName?: string;
 };
 
 export type EmployeeRole = 'member' | 'manager';

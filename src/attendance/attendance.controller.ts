@@ -65,7 +65,7 @@ export class AttendanceController {
     @Body(new ZodPipe(checkSchema)) body: CheckBody,
   ) {
     assertSelf(body.employeeId, me);
-    return this.attendance.checkIn(me.id, body);
+    return this.attendance.checkIn(me, body);
   }
 
   @Post('check-out')
@@ -75,6 +75,6 @@ export class AttendanceController {
     @Body(new ZodPipe(checkSchema)) body: CheckBody,
   ) {
     assertSelf(body.employeeId, me);
-    return this.attendance.checkOut(me.id, body);
+    return this.attendance.checkOut(me, body);
   }
 }

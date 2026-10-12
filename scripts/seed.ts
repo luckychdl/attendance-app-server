@@ -1,7 +1,7 @@
 /**
  * 초기 데이터.
  *
- *   npm run seed            직원 계정 + 공휴일
+ *   npm run seed            데모회사 + 직원 계정 + 공휴일
  *   npm run seed -- --demo  위에 더해 지난 근태 기록과 휴가 신청 예시까지
  *
  * 여러 번 돌려도 이미 있는 줄은 건드리지 않는다. (비밀번호도 덮어쓰지 않는다.)
@@ -9,6 +9,7 @@
 import { createClient } from '@supabase/supabase-js';
 import bcrypt from 'bcryptjs';
 
+import { companyKey } from '../src/lib/company.ts';
 import { loadEnv } from '../src/env.ts';
 import { resolveStatus } from '../src/lib/attendance-rules.ts';
 import { countLeaveDays, workEndMinutes, workStartMinutes } from '../src/lib/leave-rules.ts';
@@ -22,6 +23,9 @@ const db = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
 });
 const repo = createSupabaseRepo(env.supabaseUrl, env.supabaseServiceRoleKey);
 const clock = createClock(env.timeZone);
+
+/** 데모 계정이 속하는 회사. 0002_companies.sql 이 만들어 두지만 없으면 여기서 만든다. */
+const DEMO_COMPANY = '데모회사';
 
 /** 데모 계정. 비밀번호는 모두 1234 — 운영 전에 반드시 바꾼다. */
 const EMPLOYEES = [
@@ -59,20 +63,53 @@ function pseudoRandom(seed: string) {
 }
 
 async function seedBase() {
+  const nameKey = companyKey(DEMO_COMPANY);
+  ok(
+    await db
+      .from('companies')
+      .upsert({ name: DEMO_COMPANY, name_key: nameKey }, { onConflict: 'name_key', ignoreDuplicates: true }),
+  );
+  const companyId: string = ok(
+    await db.from('companies').select('id').eq('name_key', nameKey).single(),
+  )!.id;
+
+  // 기본 근무지 (서울시청). 앱 설정 화면이나 PATCH /worksite 로 옮긴다.
+  ok(
+    await db.from('worksites').upsert(
+      {
+        company_id: companyId,
+        name: '본사',
+        latitude: 37.5666805,
+        longitude: 126.9784147,
+        radius_meters: 200,
+        start_hour: 9,
+        start_minute: 0,
+        end_hour: 18,
+        end_minute: 0,
+      },
+      { onConflict: 'company_id', ignoreDuplicates: true },
+    ),
+  );
+
   const passwordHash = await bcrypt.hash('1234', 10);
   ok(
     await db.from('employees').upsert(
-      EMPLOYEES.map((item) => ({ ...item, password_hash: passwordHash })),
-      { onConflict: 'employee_no', ignoreDuplicates: true },
+      EMPLOYEES.map((item) => ({ ...item, company_id: companyId, password_hash: passwordHash })),
+      { onConflict: 'company_id,employee_no', ignoreDuplicates: true },
     ),
   );
   ok(await db.from('holidays').upsert(HOLIDAYS, { onConflict: 'date', ignoreDuplicates: true }));
-  console.log(`직원 ${EMPLOYEES.length}명, 공휴일 ${HOLIDAYS.length}일 확인`);
+  console.log(`${DEMO_COMPANY}: 직원 ${EMPLOYEES.length}명, 공휴일 ${HOLIDAYS.length}일 확인`);
+  return companyId;
 }
 
 /** 지난 영업일 12일분의 근태 기록. 대부분 정상, 일부는 지각·조기퇴근 */
-async function seedAttendance(employees: { id: string }[], holidays: Set<string>) {
-  const worksite = await repo.getWorksite();
+async function seedAttendance(
+  companyId: string,
+  employees: { id: string }[],
+  holidays: Set<string>,
+) {
+  const worksite = await repo.getWorksite(companyId);
   const location = { latitude: worksite.latitude, longitude: worksite.longitude };
   const rows = [];
 
@@ -119,10 +156,14 @@ async function seedAttendance(employees: { id: string }[], holidays: Set<string>
 
 /** 팀장(1001)에게는 결재할 거리를, 팀원(1002)에게는 대기·승인 상태를 모두 보여 준다. */
 async function seedLeaves(
+  companyId: string,
   employees: { id: string; employee_no: string; name: string; department: string; role: string }[],
   holidays: Set<string>,
 ) {
-  const { count } = await db.from('leave_requests').select('id', { count: 'exact', head: true });
+  const { count } = await db
+    .from('leave_requests')
+    .select('id', { count: 'exact', head: true })
+    .eq('company_id', companyId);
   if (count) {
     console.log('휴가 신청이 이미 있어 예시를 넣지 않습니다.');
     return;
@@ -155,6 +196,7 @@ async function seedLeaves(
     const startDate = workdayAhead(startOffset);
     const endDate = workdayAhead(endOffset);
     return {
+      company_id: companyId,
       employee_id: employee.id,
       employee_name: employee.name,
       department: employee.department,
@@ -183,17 +225,18 @@ async function seedLeaves(
   console.log(`휴가 신청 ${rows.length}건 추가`);
 }
 
-await seedBase();
+const companyId = await seedBase();
 
 if (process.argv.includes('--demo')) {
   const employees = ok(
     await db
       .from('employees')
       .select('id, employee_no, name, department, role')
+      .eq('company_id', companyId)
       .in('employee_no', EMPLOYEES.map((item) => item.employee_no)),
   )!;
   const holidays = new Set(await repo.listHolidays('2000-01-01', '2100-12-31'));
 
-  await seedAttendance(employees, holidays);
-  await seedLeaves(employees, holidays);
+  await seedAttendance(companyId, employees, holidays);
+  await seedLeaves(companyId, employees, holidays);
 }

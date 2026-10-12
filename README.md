@@ -12,11 +12,12 @@ npm install
 cp .env.example .env     # SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET 채우기
 ```
 
-1. Supabase 프로젝트의 **SQL Editor**에 [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql)을 붙여 넣어 실행합니다.
+1. Supabase 프로젝트의 **SQL Editor**에 [supabase/migrations](supabase/migrations)의 SQL을 번호 순서대로
+   (`0001_init.sql` → `0002_companies.sql`) 붙여 넣어 실행합니다.
 2. 초기 데이터를 넣습니다.
 
    ```bash
-   npm run seed -- --demo   # 직원 계정 + 공휴일 + 근태·휴가 예시 (--demo 를 빼면 계정과 공휴일만)
+   npm run seed -- --demo   # 데모회사 + 직원 계정 + 공휴일 + 근태·휴가 예시 (--demo 를 빼면 예시 제외)
    ```
 
 3. 서버를 띄웁니다.
@@ -33,7 +34,7 @@ cp .env.example .env     # SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET �
    EXPO_PUBLIC_API_BASE_URL=http://192.168.0.10:3000
    ```
 
-데모 계정 (비밀번호는 모두 `1234`, 운영 전에 꼭 바꾸세요):
+데모 계정 (회사명 `데모회사`, 비밀번호는 모두 `1234`, 운영 전에 꼭 바꾸세요):
 
 | 사번 | 이름 | 부서 | 역할 |
 | --- | --- | --- | --- |
@@ -44,12 +45,13 @@ cp .env.example .env     # SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET �
 
 ## API
 
-로그인을 뺀 모든 요청은 `Authorization: Bearer <token>`이 필요합니다.
+로그인·회원가입을 뺀 모든 요청은 `Authorization: Bearer <token>`이 필요합니다.
 요청/응답 모양은 [src/types.ts](src/types.ts)(앱의 `src/api/types.ts`와 동일)를 따릅니다.
 
 | 메서드 | 경로 | 설명 |
 | --- | --- | --- |
-| POST | `/auth/login` | 사번 + 비밀번호 → `{ employee, token }` |
+| POST | `/auth/signup` | 회사명 + 인사 정보 + 비밀번호 → `{ employee, token }` |
+| POST | `/auth/login` | 회사명 + 사번 + 비밀번호 → `{ employee, token }` |
 | GET | `/auth/me` | 토큰의 직원 정보 |
 | GET | `/attendance/today?employeeId=` | 오늘 기록. 출근 전이면 `null` |
 | GET | `/attendance/records?employeeId=&from=&to=` | 기간 내 기록, 최신순 |
@@ -66,12 +68,24 @@ cp .env.example .env     # SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET �
 실패하면 상태 코드와 함께 **사용자에게 보여 줄 문장을 `text/plain` 본문으로** 내려줍니다.
 앱이 응답 본문을 그대로 알림창에 띄우기 때문입니다 (400 잘못된 요청 · 401 로그인 필요 · 403 권한 없음 · 404 없음 · 409 상태 충돌).
 
+## 여러 회사
+
+회사(`companies`)마다 직원 · 근무지 · 휴가 결재가 따로 돕니다. 공휴일(`holidays`)만 함께 씁니다.
+
+- **회원가입** — `POST /auth/signup`에 처음 보는 회사명을 넣으면 회사와 기본 근무지(서울시청, 09–18시)가 만들어지고
+  가입자가 관리자(`role: 'manager'`)가 됩니다. 이미 있는 회사명이면 그 회사의 팀원(`member`)으로 들어갑니다.
+- **회사명** — 앞뒤·연속 공백과 대소문자 차이는 같은 회사로 봅니다 (`companies.name_key`).
+- **사번** — 회사 안에서만 겹치지 않으면 됩니다. 그래서 로그인에도 회사명이 필요합니다.
+- **분리** — 토큰의 직원이 속한 회사의 근무지만 읽고 바꾸며, 다른 회사의 휴가 신청은 404로 답합니다.
+- 회사명만 알면 누구나 팀원으로 가입할 수 있습니다. 막으려면 초대 코드나 관리자 승인을 더해야 합니다.
+- 팀장 지정 화면은 아직 없습니다. 회사를 만든 사람 외의 팀장은 Supabase에서 `employees.role`을 바꿉니다.
+
 ## 앱의 목 구현과 다른 점
 
 서버라서 달라지거나 더 엄격해진 부분입니다.
 
 - **본인 확인** — 앱은 요청마다 `employeeId`를 보내지만 누구인지는 토큰으로만 정합니다. 다른 사람의 id를 넣으면 403.
-- **근무지 변경은 팀장만** — 근무지는 전 직원이 함께 쓰는 설정이라 `PATCH /worksite`는 `role: 'manager'`만 허용합니다.
+- **근무지 변경은 팀장만** — 근무지는 회사 전 직원이 함께 쓰는 설정이라 `PATCH /worksite`는 `role: 'manager'`만 허용합니다.
   팀원이 앱의 내정보 화면에서 반경을 바꾸거나 "현재 위치를 근무지로 지정"을 누르면 403이 돌아옵니다.
 - **반경 검사** — 좌표가 근무지 반경 밖이거나 위치가 없는데 사유(`note`)도 없으면 출퇴근 요청을 거절합니다.
 - **타임존** — 근무일과 지각 판정은 기기 시각이 아니라 `APP_TIMEZONE`(기본 `Asia/Seoul`) 기준입니다.
@@ -118,7 +132,8 @@ DB 테이블은 모두 RLS를 켜고 정책을 두지 않았습니다. 서버의
 
 ## 직원 추가
 
-비밀번호는 bcrypt 해시로 저장합니다. 해시를 만든 뒤 Supabase에서 `employees`에 한 줄을 넣습니다.
+비밀번호는 bcrypt 해시로 저장합니다. 앱의 회원가입을 쓰거나, 해시를 만든 뒤 Supabase에서 `employees`에
+`company_id`와 함께 한 줄을 넣습니다.
 
 ```bash
 node -e "console.log(require('bcryptjs').hashSync(process.argv[1], 10))" '새비밀번호'

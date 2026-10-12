@@ -12,7 +12,7 @@ import type { Env } from '../src/env.ts';
 import { grantedDays } from '../src/lib/leave-rules.ts';
 import { createClock } from '../src/lib/time.ts';
 import type { EmployeeRow } from '../src/repo/types.ts';
-import { createMemoryRepo, type MemoryData } from './memory-repo.ts';
+import { createMemoryRepo, DEFAULT_WORKSITE, type MemoryData } from './memory-repo.ts';
 
 const PASSWORD_HASH = bcrypt.hashSync('1234', 4);
 const HQ = { latitude: 37.5666805, longitude: 126.9784147 };
@@ -30,6 +30,8 @@ const TEST_ENV: Env = {
 function employee(id: string, patch: Partial<EmployeeRow>): EmployeeRow {
   return {
     id,
+    companyId: 'c1',
+    companyName: '테스트회사',
     employeeNo: id,
     name: id,
     department: '개발팀',
@@ -55,22 +57,14 @@ beforeEach(async () => {
   now = kst('2026-10-06', '08:58');
   tokens.clear();
   data = {
+    companies: [{ id: 'c1', name: '테스트회사', nameKey: '테스트회사' }],
     employees: [
       employee('1001', { name: '김민준', position: '팀장', role: 'manager' }),
       employee('1002', { name: '이서연' }),
       employee('2001', { name: '박지호', department: '영업팀' }),
       employee('2002', { name: '최영업', department: '영업팀', role: 'manager' }),
     ],
-    worksite: {
-      id: 'hq',
-      name: '본사',
-      ...HQ,
-      radiusMeters: 200,
-      startHour: 9,
-      startMinute: 0,
-      endHour: 18,
-      endMinute: 0,
-    },
+    worksites: { c1: { ...DEFAULT_WORKSITE, id: 'hq', ...HQ } },
     attendance: [],
     leaves: [],
     holidays: ['2026-10-09'],
@@ -95,7 +89,7 @@ async function call(as: string | null, method: string, path: string, body?: unkn
   if (as && !tokens.has(as)) {
     const login = await request(app.getHttpServer())
       .post('/auth/login')
-      .send({ employeeNo: as, password: '1234' });
+      .send({ companyName: '테스트회사', employeeNo: as, password: '1234' });
     tokens.set(as, login.body.token);
   }
 
@@ -122,6 +116,7 @@ const requestLeave = (as: string, input: object) =>
 describe('인증', () => {
   it('사번과 비밀번호로 세션을 받는다', async () => {
     const { status, body } = await call(null, 'POST', '/auth/login', {
+      companyName: ' 테스트회사 ',
       employeeNo: ' 1001 ',
       password: '1234',
     });
@@ -133,6 +128,7 @@ describe('인증', () => {
       department: '개발팀',
       position: '팀장',
       role: 'manager',
+      companyName: '테스트회사',
     });
     expect(body.token).toEqual(expect.any(String));
 
@@ -141,13 +137,14 @@ describe('인증', () => {
 
   it('틀리면 문장을 text/plain 본문으로 내려준다', async () => {
     for (const input of [
-      { employeeNo: '1001', password: 'nope' },
-      { employeeNo: '9999', password: '1234' },
+      { companyName: '테스트회사', employeeNo: '1001', password: 'nope' },
+      { companyName: '테스트회사', employeeNo: '9999', password: '1234' },
+      { companyName: '없는회사', employeeNo: '1001', password: '1234' },
     ]) {
       const { status, type, body } = await call(null, 'POST', '/auth/login', input);
       expect(status).toBe(401);
       expect(type).toBe('text/plain');
-      expect(body).toBe('사번 또는 비밀번호가 올바르지 않습니다.');
+      expect(body).toBe('회사명, 사번 또는 비밀번호가 올바르지 않습니다.');
     }
   });
 
@@ -182,7 +179,82 @@ describe('인증', () => {
     expect(broken.status).toBe(400);
     expect(broken.text).toBe('요청 형식이 올바르지 않습니다.');
 
-    expect((await call(null, 'POST', '/auth/login', { employeeNo: '1001' })).status).toBe(400);
+    expect(
+      (await call(null, 'POST', '/auth/login', { companyName: '테스트회사', employeeNo: '1001' }))
+        .status,
+    ).toBe(400);
+  });
+});
+
+describe('회원가입', () => {
+  const profile = { name: '한새롬', department: '디자인팀', position: '대표', password: 'pass1234' };
+  const signup = (input: object) => call(null, 'POST', '/auth/signup', { ...profile, ...input });
+  const as = (token: string, method: 'get' | 'post' | 'patch', path: string, body?: object) => {
+    const req = request(app.getHttpServer())[method](path).set('Authorization', `Bearer ${token}`);
+    return body ? req.send(body) : req;
+  };
+
+  it('처음 보는 회사명이면 회사와 기본 근무지를 만들고 관리자가 된다', async () => {
+    const { status, body } = await signup({ companyName: ' 새 회사 ', employeeNo: '1' });
+    expect(status).toBe(200);
+    expect(body.employee).toMatchObject({
+      employeeNo: '1',
+      name: '한새롬',
+      role: 'manager',
+      companyName: '새 회사',
+    });
+
+    const worksite = await as(body.token, 'get', '/worksite');
+    expect(worksite.body).toMatchObject({ name: '본사', radiusMeters: 200 });
+    expect(worksite.body.id).not.toBe('hq');
+
+    // 가입한 회사명 · 사번 · 비밀번호로 로그인한다. 회사명의 공백·대소문자 차이는 같은 회사로 본다.
+    const login = await call(null, 'POST', '/auth/login', {
+      companyName: '새  회사',
+      employeeNo: '1',
+      password: 'pass1234',
+    });
+    expect(login.body.employee).toEqual(body.employee);
+  });
+
+  it('이미 있는 회사면 팀원으로 들어가고, 같은 사번은 받지 않는다', async () => {
+    const joined = await signup({ companyName: '테스트회사', employeeNo: '3001' });
+    expect(joined.body.employee).toMatchObject({ role: 'member', companyName: '테스트회사' });
+
+    const duplicate = await signup({ companyName: '테스트회사', employeeNo: '1001' });
+    expect(duplicate).toMatchObject({ status: 409, body: '이 회사에 이미 가입된 사번입니다.' });
+
+    // 사번은 회사 안에서만 겹치지 않으면 된다.
+    expect((await signup({ companyName: '다른회사', employeeNo: '1001' })).status).toBe(200);
+  });
+
+  it('빠진 항목이나 짧은 비밀번호는 거절한다', async () => {
+    expect((await signup({ companyName: '', employeeNo: '1' })).status).toBe(400);
+    expect((await signup({ companyName: '새 회사', employeeNo: '1', password: '123' })).status).toBe(400);
+    expect((await signup({ companyName: '새 회사', employeeNo: '1', name: ' ' })).status).toBe(400);
+  });
+
+  it('회사끼리는 근무지와 휴가 결재가 섞이지 않는다', async () => {
+    // 다른 회사의 개발팀 팀장
+    const other = await signup({ companyName: '다른회사', employeeNo: '1', department: '개발팀' });
+    const token = other.body.token;
+
+    const moved = await as(token, 'patch', '/worksite', { radiusMeters: 1000 });
+    expect(moved.body.radiusMeters).toBe(1000);
+    expect((await call('1001', 'GET', '/worksite')).body).toMatchObject({ id: 'hq', radiusMeters: 200 });
+
+    const pending = await requestLeave('1002', {
+      type: 'annual',
+      startDate: '2026-10-12',
+      endDate: '2026-10-12',
+    });
+    expect(pending.body.status).toBe('pending');
+
+    const inbox = await as(token, 'get', `/leave/inbox?approverId=${other.body.employee.id}`);
+    expect(inbox.body).toEqual([]);
+    const approve = await as(token, 'post', `/leave/requests/${pending.body.id}/approve`);
+    expect(approve.status).toBe(404);
+    expect(data.leaves[0].status).toBe('pending');
   });
 });
 
@@ -279,7 +351,7 @@ describe('근무지', () => {
     expect((await call('1002', 'PATCH', '/worksite', { radiusMeters: 500 })).status).toBe(403);
 
     const updated = await call('1001', 'PATCH', '/worksite', {
-      ...data.worksite,
+      ...data.worksites.c1,
       id: 'ignored',
       radiusMeters: 500,
     });

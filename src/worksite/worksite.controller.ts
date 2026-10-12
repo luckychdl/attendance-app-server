@@ -28,8 +28,8 @@ export class WorksiteController {
   constructor(private readonly worksite: WorksiteService) {}
 
   @Get()
-  get() {
-    return this.worksite.get();
+  get(@CurrentEmployee() me: EmployeeRow) {
+    return this.worksite.get(me);
   }
 
   @Patch()
