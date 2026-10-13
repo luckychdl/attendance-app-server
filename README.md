@@ -65,6 +65,18 @@ cp .env.example .env     # SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET �
 | POST | `/leave/requests/:id/cancel` · `/approve` · `/reject` | 취소 · 승인 · 반려 |
 | GET | `/health` | 상태 확인 |
 
+관리자 페이지([attendance-app-admin](../attendance-app-admin))가 쓰는 경로. `role: 'manager'`만 부를 수 있고(아니면 403),
+범위는 항상 토큰의 직원이 속한 회사입니다.
+
+| 메서드 | 경로 | 설명 |
+| --- | --- | --- |
+| GET | `/admin/overview` | 오늘 날짜 · 오늘 출근 기록 · 오늘 승인된 휴가 · 결재 대기 건수 |
+| GET | `/admin/employees?year=` | 전 직원(퇴사자 포함) + 그 해의 연차 현황 |
+| POST | `/admin/employees` | 직원 추가 (사번 · 이름 · 부서 · 직급 · 권한 · 입사일 · 비밀번호) |
+| PATCH | `/admin/employees/:id` | 인사 정보 · 권한 · 입사일 · 연간 연차 · 재직 여부 · 비밀번호 변경 |
+| GET | `/admin/attendance?from=&to=&employeeId=` | 회사 전체 근태 기록 (최대 1년) |
+| GET | `/admin/leaves?from=&to=&status=` | 회사 전체 휴가 신청 |
+
 실패하면 상태 코드와 함께 **사용자에게 보여 줄 문장을 `text/plain` 본문으로** 내려줍니다.
 앱이 응답 본문을 그대로 알림창에 띄우기 때문입니다 (400 잘못된 요청 · 401 로그인 필요 · 403 권한 없음 · 404 없음 · 409 상태 충돌).
 
@@ -78,7 +90,7 @@ cp .env.example .env     # SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET �
 - **사번** — 회사 안에서만 겹치지 않으면 됩니다. 그래서 로그인에도 회사명이 필요합니다.
 - **분리** — 토큰의 직원이 속한 회사의 근무지만 읽고 바꾸며, 다른 회사의 휴가 신청은 404로 답합니다.
 - 회사명만 알면 누구나 팀원으로 가입할 수 있습니다. 막으려면 초대 코드나 관리자 승인을 더해야 합니다.
-- 팀장 지정 화면은 아직 없습니다. 회사를 만든 사람 외의 팀장은 Supabase에서 `employees.role`을 바꿉니다.
+- 팀장(관리자) 지정은 관리자 페이지의 직원 화면에서 합니다. 본인의 권한과 재직 상태는 스스로 바꿀 수 없습니다.
 
 ## 앱의 목 구현과 다른 점
 
@@ -109,6 +121,7 @@ src/
   attendance/             # 출퇴근 (controller · service · module)
   worksite/               # 근무지
   leave/                  # 휴가 신청 · 결재
+  admin/                  # 관리자 페이지용 회사 단위 조회 · 인사 관리 (ManagerGuard)
   common/
     core.module.ts        #   전역 모듈: 환경 변수(ENV) · 시계(CLOCK) · 저장소(REPO) 제공
     text-exception.filter.ts  # 모든 실패 응답 → text/plain 문장
@@ -132,7 +145,7 @@ DB 테이블은 모두 RLS를 켜고 정책을 두지 않았습니다. 서버의
 
 ## 직원 추가
 
-비밀번호는 bcrypt 해시로 저장합니다. 앱의 회원가입을 쓰거나, 해시를 만든 뒤 Supabase에서 `employees`에
+비밀번호는 bcrypt 해시로 저장합니다. 관리자 페이지의 직원 추가나 앱의 회원가입을 쓰거나, 해시를 만든 뒤 Supabase에서 `employees`에
 `company_id`와 함께 한 줄을 넣습니다.
 
 ```bash

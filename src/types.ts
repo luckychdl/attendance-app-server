@@ -142,3 +142,28 @@ export type LeaveBalance = {
   /** granted - used - pending */
   remaining: number;
 };
+
+// ─── 관리자 페이지 (attendance-app-admin) ─────────────────────
+
+/** 관리자 화면의 직원 한 줄. 인사 정보에 그 해의 연차 현황을 붙인다. */
+export type AdminEmployee = Required<Employee> & {
+  /** 입사일 (YYYY-MM-DD) */
+  hiredAt: string;
+  /** 따로 정한 연간 연차. null 이면 근속연수로 계산한다. */
+  annualLeaveDays: number | null;
+  /** false 면 퇴사 처리. 로그인이 막힌다. */
+  active: boolean;
+  leave: LeaveBalance;
+};
+
+/** 오늘 현황 */
+export type AdminOverview = {
+  /** 서버 타임존 기준 오늘 (YYYY-MM-DD) */
+  date: string;
+  /** 오늘 출근한 기록 */
+  records: AttendanceRecord[];
+  /** 오늘에 걸친 승인된 휴가 */
+  leaves: LeaveRequest[];
+  /** 회사 전체의 결재 대기 건수 */
+  pendingLeaves: number;
+};

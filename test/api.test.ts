@@ -504,6 +504,138 @@ describe('휴가', () => {
   });
 });
 
+describe('관리자', () => {
+  it('팀원은 쓸 수 없다', async () => {
+    for (const path of ['/admin/overview', '/admin/employees', '/admin/leaves']) {
+      expect(await call('1002', 'GET', path)).toMatchObject({
+        status: 403,
+        body: '관리자만 사용할 수 있습니다.',
+      });
+    }
+    expect((await call(null, 'GET', '/admin/overview')).status).toBe(401);
+  });
+
+  it('오늘 현황과 기간별 근태를 회사 단위로 본다', async () => {
+    data.companies.push({ id: 'c2', name: '다른회사', nameKey: '다른회사' });
+    data.worksites.c2 = { ...DEFAULT_WORKSITE, id: 'other' };
+    data.employees.push(employee('9001', { companyId: 'c2', companyName: '다른회사' }));
+
+    await check('1002', 'in');
+    await check('2001', 'in');
+    await call(null, 'POST', '/auth/login', { companyName: '다른회사', employeeNo: '9001', password: '1234' })
+      .then(({ body }) => tokens.set('9001', body.token));
+    await check('9001', 'in');
+    await requestLeave('2001', { type: 'annual', startDate: '2026-10-07', endDate: '2026-10-07' });
+
+    const overview = (await call('1001', 'GET', '/admin/overview')).body;
+    expect(overview.date).toBe('2026-10-06');
+    expect(overview.records.map((r: { employeeId: string }) => r.employeeId).sort()).toEqual([
+      '1002',
+      '2001',
+    ]);
+    expect(overview.records[0].status).toBe('working');
+    expect(overview.pendingLeaves).toBe(1);
+
+    // 날짜가 지나면 퇴근 미체크로 읽힌다.
+    now = kst('2026-10-07', '09:00');
+    const range = '/admin/attendance?from=2026-10-01&to=2026-10-31';
+    const records = (await call('1001', 'GET', range)).body;
+    expect(records).toHaveLength(2);
+    expect(records[0].status).toBe('missingCheckOut');
+    expect((await call('1001', 'GET', `${range}&employeeId=1002`)).body).toHaveLength(1);
+    expect((await call('1001', 'GET', `${range}&employeeId=9001`)).body).toHaveLength(0);
+
+    expect((await call('1001', 'GET', '/admin/attendance?from=2026-10-02&to=2026-10-01')).status).toBe(400);
+    expect((await call('1001', 'GET', '/admin/attendance?from=2025-01-01&to=2026-10-01')).status).toBe(400);
+  });
+
+  it('직원 목록에 연차 현황이 붙고, 회사 전체 휴가를 상태로 거른다', async () => {
+    await requestLeave('1002', { type: 'annual', startDate: '2026-10-07', endDate: '2026-10-08' });
+    await requestLeave('2001', { type: 'halfAm', startDate: '2026-10-12', endDate: '2026-10-12' });
+    const inbox = (await call('2002', 'GET', '/leave/inbox?approverId=2002')).body;
+    await call('2002', 'POST', `/leave/requests/${inbox[0].id}/approve`);
+
+    const employees = (await call('1001', 'GET', '/admin/employees')).body;
+    expect(employees.map((e: { employeeNo: string }) => e.employeeNo)).toEqual([
+      '1001',
+      '1002',
+      '2001',
+      '2002',
+    ]);
+    expect(employees[1]).toMatchObject({
+      name: '이서연',
+      hiredAt: '2020-03-02',
+      active: true,
+      leave: { year: 2026, granted: 15, used: 0, pending: 2, remaining: 13 },
+    });
+    expect(employees[1].passwordHash).toBeUndefined();
+    expect(employees[2].leave).toMatchObject({ used: 0.5, pending: 0 });
+
+    expect((await call('1001', 'GET', '/admin/leaves')).body).toHaveLength(2);
+    const pending = (await call('1001', 'GET', '/admin/leaves?status=pending')).body;
+    expect(pending.map((l: { employeeName: string }) => l.employeeName)).toEqual(['이서연']);
+    expect(
+      (await call('1001', 'GET', '/admin/leaves?from=2026-10-12&to=2026-10-12')).body,
+    ).toHaveLength(1);
+  });
+
+  it('직원을 추가하고 인사 정보를 바꾼다', async () => {
+    const input = { employeeNo: '1003', name: '정하늘', department: '개발팀', position: '사원', password: 'pass1234' };
+    const created = await call('1001', 'POST', '/admin/employees', { ...input, hiredAt: '2026-01-01' });
+    expect(created.status).toBe(200);
+    expect(created.body).toMatchObject({
+      employeeNo: '1003',
+      role: 'member',
+      hiredAt: '2026-01-01',
+      companyName: '테스트회사',
+      leave: { granted: 11 },
+    });
+    expect(await call('1001', 'POST', '/admin/employees', input)).toMatchObject({
+      status: 409,
+      body: '이미 쓰고 있는 사번입니다.',
+    });
+    expect((await call('1001', 'POST', '/admin/employees', { ...input, employeeNo: '1004', password: '1' })).status).toBe(400);
+
+    const login = (password: string) =>
+      call(null, 'POST', '/auth/login', { companyName: '테스트회사', employeeNo: '1003', password });
+    expect((await login('pass1234')).status).toBe(200);
+
+    const id = created.body.id;
+    const updated = await call('1001', 'PATCH', `/admin/employees/${id}`, {
+      department: '영업팀',
+      role: 'manager',
+      annualLeaveDays: 20,
+      password: 'changed!',
+    });
+    expect(updated.body).toMatchObject({
+      department: '영업팀',
+      role: 'manager',
+      annualLeaveDays: 20,
+      leave: { granted: 20 },
+    });
+    expect((await login('pass1234')).status).toBe(401);
+    expect((await login('changed!')).status).toBe(200);
+
+    // 퇴사 처리하면 로그인이 막힌다.
+    await call('1001', 'PATCH', `/admin/employees/${id}`, { active: false });
+    expect((await login('changed!')).status).toBe(401);
+  });
+
+  it('본인의 권한은 내려놓지 못하고, 다른 회사 직원은 건드리지 못한다', async () => {
+    expect(await call('1001', 'PATCH', '/admin/employees/1001', { role: 'member' })).toMatchObject({
+      status: 400,
+      body: '본인의 권한과 재직 상태는 직접 바꿀 수 없습니다.',
+    });
+    expect((await call('1001', 'PATCH', '/admin/employees/1001', { active: false })).status).toBe(400);
+    expect((await call('1001', 'PATCH', '/admin/employees/1001', { position: '이사' })).body.position).toBe('이사');
+
+    data.employees.push(employee('9001', { companyId: 'c2', companyName: '다른회사' }));
+    expect((await call('1001', 'PATCH', '/admin/employees/9001', { name: '침입' })).status).toBe(404);
+    expect((await call('1001', 'PATCH', '/admin/employees/none', { name: '침입' })).status).toBe(404);
+    expect(data.employees.at(-1)!.name).toBe('9001');
+  });
+});
+
 describe('규칙', () => {
   it('연차는 근속연수로 부여한다', () => {
     const hired = (hiredAt: string) => ({ hiredAt, annualLeaveDays: null });

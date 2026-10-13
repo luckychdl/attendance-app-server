@@ -36,7 +36,7 @@ export function createMemoryRepo(data: MemoryData): Repo {
       companyId: company.id,
       companyName: company.name,
       role,
-      hiredAt: '2026-10-06',
+      hiredAt: employee.hiredAt ?? '2026-10-06',
       annualLeaveDays: null,
       active: true,
     };
@@ -58,7 +58,7 @@ export function createMemoryRepo(data: MemoryData): Repo {
     async insertEmployee(companyId, employee) {
       if (await this.findEmployeeByNo(companyId, employee.employeeNo)) return null;
       const company = data.companies.find((item) => item.id === companyId)!;
-      return addEmployee(company, employee, 'member');
+      return addEmployee(company, employee, employee.role ?? 'member');
     },
 
     async findEmployeeByNo(companyId, employeeNo) {
@@ -70,6 +70,16 @@ export function createMemoryRepo(data: MemoryData): Repo {
     },
     async findEmployeeById(id) {
       return data.employees.find((item) => item.id === id) ?? null;
+    },
+    async listEmployees(companyId) {
+      return data.employees
+        .filter((item) => item.companyId === companyId)
+        .sort((a, b) => a.employeeNo.localeCompare(b.employeeNo));
+    },
+    async updateEmployee(id, patch) {
+      const found = data.employees.find((item) => item.id === id)!;
+      Object.assign(found, patch);
+      return found;
     },
 
     async getWorksite(companyId) {
@@ -92,6 +102,17 @@ export function createMemoryRepo(data: MemoryData): Repo {
       return data.attendance
         .filter(
           (item) => item.employeeId === employeeId && item.workDate >= from && item.workDate <= to,
+        )
+        .sort((a, b) => b.workDate.localeCompare(a.workDate));
+    },
+    async listCompanyAttendance(companyId, from, to, employeeId) {
+      return data.attendance
+        .filter(
+          (item) =>
+            companyOf(item.employeeId) === companyId &&
+            (employeeId === undefined || item.employeeId === employeeId) &&
+            item.workDate >= from &&
+            item.workDate <= to,
         )
         .sort((a, b) => b.workDate.localeCompare(a.workDate));
     },
@@ -118,6 +139,20 @@ export function createMemoryRepo(data: MemoryData): Repo {
       return data.leaves
         .filter(
           (item) => item.employeeId === employeeId && item.endDate >= from && item.startDate <= to,
+        )
+        .sort(
+          (a, b) =>
+            b.startDate.localeCompare(a.startDate) || b.requestedAt.localeCompare(a.requestedAt),
+        );
+    },
+    async listCompanyLeaves(companyId, filter = {}) {
+      return data.leaves
+        .filter(
+          (item) =>
+            companyOf(item.employeeId) === companyId &&
+            (!filter.from || item.endDate >= filter.from) &&
+            (!filter.to || item.startDate <= filter.to) &&
+            (!filter.status || item.status === filter.status),
         )
         .sort(
           (a, b) =>

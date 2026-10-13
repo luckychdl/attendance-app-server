@@ -1,7 +1,7 @@
 import { createClient, type PostgrestError } from '@supabase/supabase-js';
 
 import type { AttendanceRecord, LeaveRequest, Worksite } from '../types.ts';
-import type { EmployeeRow, NewEmployee, Repo } from './types.ts';
+import type { EmployeePatch, EmployeeRow, NewEmployee, Repo } from './types.ts';
 
 type Row = Record<string, any>;
 
@@ -19,6 +19,20 @@ type Result<T> = { data: T | null; error: PostgrestError | null };
 
 const one = (result: Result<Row>): Row => check(result)!;
 const many = (result: Result<Row[]>): Row[] => check(result) ?? [];
+
+/** uuid 컬럼에 다른 모양의 값을 넣으면 Postgres 가 오류를 내므로 조회 전에 거른다. */
+const UUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+
+/** PostgREST 는 한 번에 1000줄까지만 준다. 회사 전체 조회는 끝까지 이어 읽는다. */
+const PAGE = 1000;
+async function all(page: (from: number, to: number) => PromiseLike<Result<Row[]>>) {
+  const rows: Row[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const chunk = many(await page(from, from + PAGE - 1));
+    rows.push(...chunk);
+    if (chunk.length < PAGE) return rows;
+  }
+}
 
 const iso = (value: string | null) => (value ? new Date(value).toISOString() : null);
 
@@ -91,6 +105,17 @@ function toLeave(row: Row): LeaveRequest {
   };
 }
 
+const EMPLOYEE_COLUMNS = {
+  name: 'name',
+  department: 'department',
+  position: 'position',
+  role: 'role',
+  hiredAt: 'hired_at',
+  annualLeaveDays: 'annual_leave_days',
+  active: 'active',
+  passwordHash: 'password_hash',
+} as const satisfies Record<keyof EmployeePatch, string>;
+
 const WORKSITE_COLUMNS = {
   name: 'name',
   latitude: 'latitude',
@@ -139,8 +164,9 @@ export function createSupabaseRepo(url: string, serviceRoleKey: string): Repo {
           name: employee.name,
           department: employee.department,
           position: employee.position,
-          role: 'member',
+          role: employee.role ?? 'member',
           password_hash: employee.passwordHash,
+          ...(employee.hiredAt ? { hired_at: employee.hiredAt } : {}),
         })
         .select(EMPLOYEE_SELECT)
         .single();
@@ -161,10 +187,35 @@ export function createSupabaseRepo(url: string, serviceRoleKey: string): Repo {
     },
 
     async findEmployeeById(id) {
+      if (!UUID.test(id)) return null;
       const row = check(
         await db.from('employees').select(EMPLOYEE_SELECT).eq('id', id).maybeSingle(),
       );
       return row ? toEmployee(row) : null;
+    },
+
+    async listEmployees(companyId) {
+      const rows = await all((from, to) =>
+        db
+          .from('employees')
+          .select(EMPLOYEE_SELECT)
+          .eq('company_id', companyId)
+          .order('employee_no')
+          .order('id')
+          .range(from, to),
+      );
+      return rows.map(toEmployee);
+    },
+
+    async updateEmployee(id, patch) {
+      const values: Row = {};
+      for (const [key, column] of Object.entries(EMPLOYEE_COLUMNS)) {
+        const value = patch[key as keyof EmployeePatch];
+        if (value !== undefined) values[column] = value;
+      }
+      return toEmployee(
+        one(await db.from('employees').update(values).eq('id', id).select(EMPLOYEE_SELECT).single()),
+      );
     },
 
     async getWorksite(companyId) {
@@ -208,6 +259,24 @@ export function createSupabaseRepo(url: string, serviceRoleKey: string): Repo {
           .lte('work_date', to)
           .order('work_date', { ascending: false }),
       );
+      return rows.map(toAttendance);
+    },
+
+    async listCompanyAttendance(companyId, from, to, employeeId) {
+      if (employeeId !== undefined && !UUID.test(employeeId)) return [];
+      const rows = await all((start, end) => {
+        let query = db
+          .from('attendance_records')
+          .select('*, employees!inner(company_id)')
+          .eq('employees.company_id', companyId)
+          .gte('work_date', from)
+          .lte('work_date', to);
+        if (employeeId) query = query.eq('employee_id', employeeId);
+        return query
+          .order('work_date', { ascending: false })
+          .order('id')
+          .range(start, end);
+      });
       return rows.map(toAttendance);
     },
 
@@ -273,6 +342,21 @@ export function createSupabaseRepo(url: string, serviceRoleKey: string): Repo {
           .order('start_date', { ascending: false })
           .order('requested_at', { ascending: false }),
       );
+      return rows.map(toLeave);
+    },
+
+    async listCompanyLeaves(companyId, filter = {}) {
+      const rows = await all((start, end) => {
+        let query = db.from('leave_requests').select().eq('company_id', companyId);
+        if (filter.from) query = query.gte('end_date', filter.from);
+        if (filter.to) query = query.lte('start_date', filter.to);
+        if (filter.status) query = query.eq('status', filter.status);
+        return query
+          .order('start_date', { ascending: false })
+          .order('requested_at', { ascending: false })
+          .order('id')
+          .range(start, end);
+      });
       return rows.map(toLeave);
     },
 

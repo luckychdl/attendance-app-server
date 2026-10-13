@@ -37,7 +37,7 @@ export class AttendanceService {
   ) {}
 
   /** 퇴근 전 기록은 읽는 날짜에 따라 근무중 ↔ 퇴근 미체크가 갈린다. */
-  private present(record: AttendanceRecord): AttendanceRecord {
+  present(record: AttendanceRecord): AttendanceRecord {
     if (record.checkOutAt) return record;
     return {
       ...record,

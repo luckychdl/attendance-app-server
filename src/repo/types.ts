@@ -22,7 +22,27 @@ export type Company = { id: string; name: string };
 /** 가입할 때 받는 인사 정보 */
 export type NewEmployee = Pick<EmployeeRow, 'employeeNo' | 'name' | 'department' | 'position'> & {
   passwordHash: string;
+  /** 관리자가 직접 추가할 때만 정한다. 비우면 member · 오늘 입사 */
+  role?: EmployeeRow['role'];
+  hiredAt?: string;
 };
+
+/** 관리자가 바꿀 수 있는 인사 정보 */
+export type EmployeePatch = Partial<
+  Pick<
+    EmployeeRow,
+    | 'name'
+    | 'department'
+    | 'position'
+    | 'role'
+    | 'hiredAt'
+    | 'annualLeaveDays'
+    | 'active'
+    | 'passwordHash'
+  >
+>;
+
+export type LeaveFilter = { from?: string; to?: string; status?: LeaveStatus };
 
 export type WorksitePatch = Partial<Omit<Worksite, 'id'>>;
 
@@ -40,6 +60,9 @@ export interface Repo {
 
   findEmployeeByNo(companyId: string, employeeNo: string): Promise<EmployeeRow | null>;
   findEmployeeById(id: string): Promise<EmployeeRow | null>;
+  /** 회사의 전 직원 (퇴사자 포함). 사번 순 */
+  listEmployees(companyId: string): Promise<EmployeeRow[]>;
+  updateEmployee(id: string, patch: EmployeePatch): Promise<EmployeeRow>;
 
   getWorksite(companyId: string): Promise<Worksite>;
   updateWorksite(id: string, patch: WorksitePatch): Promise<Worksite>;
@@ -47,6 +70,13 @@ export interface Repo {
   findAttendance(employeeId: string, workDate: string): Promise<AttendanceRecord | null>;
   /** 기간 내 기록. 근무일 최신순 */
   listAttendance(employeeId: string, from: string, to: string): Promise<AttendanceRecord[]>;
+  /** 회사 전 직원의 기간 내 기록. employeeId 를 주면 그 직원만. 근무일 최신순 */
+  listCompanyAttendance(
+    companyId: string,
+    from: string,
+    to: string,
+    employeeId?: string,
+  ): Promise<AttendanceRecord[]>;
   /** 같은 날 기록이 이미 있으면 null */
   insertAttendance(record: Omit<AttendanceRecord, 'id'>): Promise<AttendanceRecord | null>;
   /** 퇴근 처리. 이미 퇴근한 기록이면 null */
@@ -62,6 +92,8 @@ export interface Repo {
   findLeave(id: string, companyId: string): Promise<LeaveRequest | null>;
   /** 기간과 겹치는 신청. 시작일 최신순 */
   listLeaves(employeeId: string, from: string, to: string): Promise<LeaveRequest[]>;
+  /** 회사 전체의 신청. 기간을 주면 겹치는 것만. 시작일 최신순 */
+  listCompanyLeaves(companyId: string, filter?: LeaveFilter): Promise<LeaveRequest[]>;
   /** 회사 안 한 부서의 결재 대기 신청. 시작일이 가까운 순 */
   listPendingLeaves(companyId: string, department: string): Promise<LeaveRequest[]>;
   insertLeave(companyId: string, leave: Omit<LeaveRequest, 'id'>): Promise<LeaveRequest>;
